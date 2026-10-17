@@ -92,6 +92,7 @@ pub fn run(tx: Sender<Incoming>, enabled: impl Fn() -> bool) {
         if let Ok(list) = listener.GetNotificationsAsync(NotificationKinds::Toast).and_then(|op| op.get()) {
             let mut present = HashSet::new();
             let display = enabled() && !explorer_running();
+            let mut sent = false;
             for n in list {
                 let Ok((id, note, created)) = read(&n) else { continue };
                 present.insert(id);
@@ -105,12 +106,19 @@ pub fn run(tx: Sender<Incoming>, enabled: impl Fn() -> bool) {
                     } else {
                         Incoming::History { note, created }
                     });
+                    sent = true;
                 }
             }
             seen.retain(|id| present.contains(id));
             first = false;
+            // The UI only drains the queue when it repaints, and it sleeps while idle: without
+            // this, app notifications (WhatsApp, Discord…) waited until something else (an IPC
+            // notification, a click) happened to wake it.
+            if sent {
+                crate::wake();
+            }
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 

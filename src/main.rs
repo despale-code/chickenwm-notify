@@ -165,6 +165,8 @@ struct App {
     rx: Receiver<Incoming>,
     cfg: NotificationsConfig,
     css: Arc<Mutex<CssStyleSheet>>,
+    /// Keeps the UI font in step with `--font-family` in notifications.css.
+    font: chickenwm_core::fonts::EguiFont,
     style: Style,
     stored: Stored,
     toasts: Vec<Toast>,
@@ -215,6 +217,7 @@ impl App {
             rx,
             cfg: load_config(),
             css,
+            font: Default::default(),
             style,
             stored: load_store(),
             toasts: Vec::new(),
@@ -376,6 +379,8 @@ fn primary_work_area() -> [f32; 4] {
 
 const PAD: f32 = 18.0; // room for card shadows inside the window
 const CENTER_W: f32 = 400.0;
+/// Diameter of the "clear all" button under the notification stack.
+const CLEAR_BTN: f32 = 32.0;
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -390,6 +395,7 @@ impl eframe::App for App {
         self.last_frame = Instant::now();
         self.drain();
         let style = Style::from_css(&self.css.lock());
+        self.font.sync(ctx, &self.css.lock(), false);
         if style != self.style || !self.visuals_set {
             self.style = style;
             apply_visuals(ctx, &style);
@@ -409,6 +415,8 @@ impl eframe::App for App {
         let text_w = st.card_w - st.padding * 2.0 - if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 };
         let heights: Vec<f32> = self.toasts.iter().map(|t| card_height(ctx, &st, &t.note, text_w, 4)).collect();
         let stack_h: f32 = heights.iter().sum::<f32>() + st.gap * heights.len().saturating_sub(1) as f32;
+        // Room for the single "clear all" button below the stack.
+        let clear_h = CLEAR_BTN + st.gap;
 
         // Window geometry.
         let (size, passthrough) = if self.center_open {
@@ -416,7 +424,7 @@ impl eframe::App for App {
         } else if self.toasts.is_empty() {
             (egui::vec2(1.0, 1.0), true)
         } else {
-            (egui::vec2(st.card_w + PAD * 2.0, stack_h + PAD * 2.0), false)
+            (egui::vec2(st.card_w + PAD * 2.0, stack_h + clear_h + PAD * 2.0), false)
         };
         let center_h = if self.center_open { if hside < 0.0 { -1.0 } else { 1.0 } } else { hside };
         let x = match center_h {
@@ -445,7 +453,8 @@ impl eframe::App for App {
             }
             // Timers pause while the pointer is over the stack.
             let hovering = ui.rect_contains_pointer(ui.max_rect()) && !self.toasts.is_empty();
-            let mut y = if vside < 0.0 { PAD } else { size.y - PAD };
+            // Bottom-anchored stacks grow upward, so the button sits below them at the bottom.
+            let mut y = if vside < 0.0 { PAD } else { size.y - PAD - clear_h };
             for (t, &h) in self.toasts.iter_mut().zip(&heights) {
                 if !hovering && t.leaving.is_none() {
                     if let Some(limit) = t.timeout {
@@ -467,6 +476,28 @@ impl eframe::App for App {
                 let dy = if hside == 0.0 { (1.0 - enter) * 16.0 * -vside } else { 0.0 };
                 let rect = Rect::from_min_size(Pos2::new(PAD + dx, top + dy), egui::vec2(st.card_w, h));
                 draw_toast(ui, &st, t, rect, alpha, text_w, &mut actions);
+            }
+
+            // One "clear all" button below every notification.
+            let any_live = self.toasts.iter().any(|t| t.leaving.is_none());
+            let shown = ui.ctx().animate_bool_with_time(egui::Id::new("clear-all-shown"), any_live, st.anim_secs);
+            if shown > 0.01 {
+                let btn_y = if vside < 0.0 { PAD + stack_h + st.gap } else { size.y - PAD - CLEAR_BTN };
+                let btn_y = ui.ctx().animate_value_with_time(egui::Id::new("clear-all-y"), btn_y, 0.22);
+                let center = Pos2::new(PAD + st.card_w / 2.0, btn_y + CLEAR_BTN / 2.0);
+                let hit = Rect::from_center_size(center, Vec2::splat(CLEAR_BTN));
+                let resp = ui.interact(hit, egui::Id::new("clear-all"), Sense::click()).on_hover_text("Clear all notifications");
+                let hover = ui.ctx().animate_bool_with_time(egui::Id::new("clear-all-hover"), resp.hovered(), 0.12);
+                let r = CLEAR_BTN / 2.0 * (0.85 + 0.15 * shown) * (1.0 + 0.08 * hover);
+                let painter = ui.painter();
+                let shadow = egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: st.shadow.gamma_multiply(shown) };
+                painter.add(shadow.as_shape(Rect::from_center_size(center, Vec2::splat(r * 2.0)), CornerRadius::same(r as u8)));
+                painter.circle(center, r, st.card_bg.gamma_multiply(shown), Stroke::new(1.0_f32, st.border.gamma_multiply(shown)));
+                let glyph = if hover > 0.5 { st.fg } else { st.sub };
+                painter.text(center, Align2::CENTER_CENTER, "×", FontId::proportional(15.0 + 2.0 * hover), glyph.gamma_multiply(shown));
+                if resp.clicked() && any_live {
+                    actions.push(UiAction::DismissAll);
+                }
             }
         });
 
