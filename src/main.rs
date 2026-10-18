@@ -246,7 +246,23 @@ impl App {
         self.cfg.blocked.iter().any(|b| b.eq_ignore_ascii_case(app.trim()))
     }
 
+    fn is_dnd_exception(&self, app: &str) -> bool {
+        self.cfg.dnd_exceptions.iter().any(|e| e.eq_ignore_ascii_case(app.trim()))
+    }
+
+    fn is_quiet_hours_now(&self) -> bool {
+        let (_, _, _, minute, _) = chickenwm_core::theme_tools::local_clock();
+        is_in_quiet_hours(&self.cfg.quiet_hours, minute)
+    }
+
+    fn effective_dnd(&self) -> bool {
+        self.stored.do_not_disturb || self.is_quiet_hours_now()
+    }
+
     fn record(&mut self, note: &Notification, time: u64, toast_id: Option<u32>) {
+        if !self.center_open {
+            UNREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.stored.history.insert(
             0,
             HistoryEntry { app: note.app.clone(), title: note.title.clone(), body: note.body.clone(), time, toast_id },
@@ -261,7 +277,7 @@ impl App {
         }
         self.record(&note, created.unwrap_or_else(now_secs), toast_id);
         let critical = note.urgency.as_deref() == Some("critical");
-        if self.stored.do_not_disturb && !critical {
+        if self.effective_dnd() && !critical && !self.is_dnd_exception(&note.app) {
             return;
         }
         let secs = note.timeout_secs.unwrap_or(self.cfg.timeout);
@@ -319,6 +335,53 @@ impl App {
         }
     }
 
+    /// Adds or removes an app from DND exceptions (`notifications { dnd_exceptions = … }`).
+    fn set_dnd_exception(&mut self, app: &str, allow: bool) {
+        let app = app.trim().to_string();
+        if allow {
+            if !self.is_dnd_exception(&app) {
+                self.cfg.dnd_exceptions.push(app);
+            }
+        } else {
+            self.cfg.dnd_exceptions.retain(|e| !e.eq_ignore_ascii_case(&app));
+        }
+        if let Ok((mut doc, _)) = chickenwm_core::config::load_or_init_config() {
+            doc.set_category_key("notifications", "dnd_exceptions", &self.cfg.dnd_exceptions.join(", "));
+            if let Err(e) = chickenwm_core::config::save_config_document(&doc) {
+                tracing::warn!("couldn't save DND exceptions: {e}");
+            }
+        }
+    }
+
+    fn save_quiet_hours(&mut self, schedule: String) {
+        self.cfg.quiet_hours = schedule.trim().to_string();
+        if let Ok((mut doc, _)) = chickenwm_core::config::load_or_init_config() {
+            doc.set_category_key("notifications", "quiet_hours", &self.cfg.quiet_hours);
+            let _ = chickenwm_core::config::save_config_document(&doc);
+        }
+    }
+
+    fn clear_app_history(&mut self, app: &str) {
+        let mut toast_ids = Vec::new();
+        self.stored.history.retain(|e| {
+            let matches = e.app.eq_ignore_ascii_case(app);
+            if matches {
+                if let Some(id) = e.toast_id {
+                    toast_ids.push(id);
+                }
+            }
+            !matches
+        });
+        if !toast_ids.is_empty() {
+            std::thread::spawn(move || {
+                for id in toast_ids {
+                    toasts::remove(id);
+                }
+            });
+        }
+        self.save_store();
+    }
+
     fn drain(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -332,6 +395,9 @@ impl App {
                 Incoming::ToggleCenter => {
                     self.center_open = !self.center_open;
                     self.center_since = Instant::now();
+                    if self.center_open {
+                        UNREAD.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 Incoming::Reload => {
                     self.cfg = load_config();
@@ -388,6 +454,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        DND.store(self.effective_dnd(), std::sync::atomic::Ordering::Relaxed);
         if !self.window_ready {
             self.window_ready = prepare_window(frame);
         }
@@ -511,6 +578,13 @@ impl eframe::App for App {
                 UiAction::DismissAll => self.dismiss_all(),
                 UiAction::Block(app) => self.set_blocked(&app, true),
                 UiAction::Unblock(app) => self.set_blocked(&app, false),
+                UiAction::AllowInDnd(app, allow) => self.set_dnd_exception(&app, allow),
+                UiAction::SetQuietHours(s) => self.save_quiet_hours(s),
+                UiAction::ClearAppHistory(app) => self.clear_app_history(&app),
+                UiAction::FocusAppWindow(app) => {
+                    focus_source_window(&app);
+                    self.center_open = false;
+                }
                 UiAction::OpenCenter => {
                     self.center_open = true;
                     self.center_since = Instant::now();
@@ -561,6 +635,10 @@ enum UiAction {
     DismissAll,
     Block(String),
     Unblock(String),
+    AllowInDnd(String, bool),
+    SetQuietHours(String),
+    ClearAppHistory(String),
+    FocusAppWindow(String),
     OpenCenter,
     CloseCenter,
     ClearHistory,
@@ -658,17 +736,30 @@ fn draw_toast(ui: &mut egui::Ui, st: &Style, t: &Toast, rect: Rect, alpha: f32, 
         painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(11.0), st.sub.gamma_multiply(alpha));
     }
     if resp.clicked() {
+        let over_close = ui.rect_contains_pointer(close_rect);
+        if !over_close {
+            actions.push(UiAction::FocusAppWindow(t.note.app.clone()));
+        }
         actions.push(UiAction::Dismiss(t.key));
     }
     let app = t.note.app.clone();
     let key = t.key;
     resp.context_menu(|ui| {
+        if ui.button(format!("Focus {app}")).clicked() {
+            actions.push(UiAction::FocusAppWindow(app.clone()));
+            actions.push(UiAction::Dismiss(key));
+            ui.close_menu();
+        }
         if ui.button("Dismiss").clicked() {
             actions.push(UiAction::Dismiss(key));
             ui.close_menu();
         }
         if ui.button("Dismiss all").clicked() {
             actions.push(UiAction::DismissAll);
+            ui.close_menu();
+        }
+        if ui.button(format!("Allow {app} during Do Not Disturb")).clicked() {
+            actions.push(UiAction::AllowInDnd(app.clone(), true));
             ui.close_menu();
         }
         if ui.button(format!("Block notifications from {app}")).clicked() {
@@ -679,6 +770,82 @@ fn draw_toast(ui: &mut egui::Ui, st: &Style, t: &Toast, rect: Rect, alpha: f32, 
         if ui.button("Notification center  (Super+N)").clicked() {
             actions.push(UiAction::OpenCenter);
             ui.close_menu();
+        }
+    });
+}
+
+/// Checks whether `minute` (0..1440 after local midnight) falls inside `schedule` (`"22:00-07:00"`).
+fn is_in_quiet_hours(schedule: &str, minute: u32) -> bool {
+    let Some((start_s, end_s)) = schedule.trim().split_once('-') else {
+        return false;
+    };
+    let (Some(start), Some(end)) = (
+        chickenwm_core::theme_tools::parse_hm(start_s),
+        chickenwm_core::theme_tools::parse_hm(end_s),
+    ) else {
+        return false;
+    };
+    if start == end {
+        return false;
+    }
+    if start < end {
+        minute >= start && minute < end
+    } else {
+        minute >= start || minute < end
+    }
+}
+
+/// Groups history entries by app (case-insensitive), preserving the order of each app's most recent notification.
+fn group_history_by_app(history: &[HistoryEntry]) -> Vec<(String, Vec<(usize, &HistoryEntry)>)> {
+    let mut groups: Vec<(String, Vec<(usize, &HistoryEntry)>)> = Vec::new();
+    for (idx, entry) in history.iter().enumerate() {
+        let app_key = if entry.app.trim().is_empty() { "System" } else { entry.app.trim() };
+        if let Some((_, items)) = groups.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(app_key)) {
+            items.push((idx, entry));
+        } else {
+            groups.push((app_key.to_string(), vec![(idx, entry)]));
+        }
+    }
+    groups
+}
+
+/// Focuses the open window belonging to `app` (matching process name, class, or window title) via WM IPC.
+fn focus_source_window(app: &str) {
+    let app_q = app.trim().to_ascii_lowercase();
+    if app_q.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        use chickenwm_core::ipc::{send_ipc_command_blocking, PIPE_NAME_WM};
+        let Ok(IpcResponse::Clients(clients)) =
+            send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::QueryClients)
+        else {
+            return;
+        };
+        let target = clients.iter().find(|c| {
+            let proc_stem = c.process_name.trim_end_matches(".exe").to_ascii_lowercase();
+            proc_stem == app_q
+                || proc_stem.contains(&app_q)
+                || app_q.contains(&proc_stem) && !proc_stem.is_empty()
+                || c.class.to_ascii_lowercase().contains(&app_q)
+                || c.title.to_ascii_lowercase().contains(&app_q)
+        });
+        if let Some(c) = target {
+            let _ = send_ipc_command_blocking(
+                PIPE_NAME_WM,
+                &IpcCommand::Dispatch(chickenwm_core::ipc::Action::Workspace(c.workspace_id)),
+            );
+            unsafe {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+                };
+                let hwnd = HWND(c.hwnd as *mut core::ffi::c_void);
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(hwnd);
+            }
         }
     });
 }
@@ -715,14 +882,32 @@ impl App {
             });
         });
         ui.add_space(4.0);
+        let quiet_now = self.is_quiet_hours_now();
         let mut dnd = self.stored.do_not_disturb;
-        if ui.checkbox(&mut dnd, "Do not disturb (only critical notifications pop up)").changed() {
+        let dnd_label = if quiet_now && !dnd {
+            format!("Do not disturb (active via quiet hours {})", self.cfg.quiet_hours)
+        } else {
+            "Do not disturb (only critical / exception apps pop up)".to_string()
+        };
+        if ui.checkbox(&mut dnd, dnd_label).changed() {
             actions.push(UiAction::ToggleDnd);
         }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Quiet hours:").size(st.app_size).color(st.sub));
+            let current_qh = if self.cfg.quiet_hours.is_empty() { "Off" } else { &self.cfg.quiet_hours };
+            ui.label(egui::RichText::new(current_qh).size(st.app_size).color(st.fg));
+            for (label, sched) in [("Off", ""), ("22:00–07:00", "22:00-07:00"), ("23:00–08:00", "23:00-08:00")] {
+                let selected = self.cfg.quiet_hours == sched;
+                if ui.selectable_label(selected, egui::RichText::new(label).size(st.app_size)).clicked() {
+                    actions.push(UiAction::SetQuietHours(sched.to_string()));
+                }
+            }
+        });
         ui.add_space(6.0);
         ui.separator();
 
-        let footer_h = if self.cfg.blocked.is_empty() { 0.0 } else { 64.0 };
+        let has_footer = !self.cfg.blocked.is_empty() || !self.cfg.dnd_exceptions.is_empty();
+        let footer_h = if has_footer { 84.0 } else { 0.0 };
         let list_h = (ui.available_height() - footer_h).max(60.0);
         let text_w = ui.available_width() - st.padding * 2.0 - if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 } - 8.0;
         egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
@@ -730,51 +915,115 @@ impl App {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| ui.label(egui::RichText::new("No notifications").color(st.sub)));
             }
-            for (i, e) in self.stored.history.iter().enumerate() {
-                let note = Notification { app: e.app.clone(), title: e.title.clone(), body: e.body.clone(), ..Default::default() };
-                let h = card_height(ui.ctx(), st, &note, text_w, 6);
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width() - 4.0, h), Sense::click());
-                let painter = ui.painter();
-                painter.rect(
-                    rect,
-                    CornerRadius::same(st.radius.saturating_sub(2)),
-                    if resp.hovered() { st.border.gamma_multiply(0.35 * appear) } else { Color32::TRANSPARENT },
-                    Stroke::new(1.0_f32, st.border.gamma_multiply(appear)),
-                    egui::StrokeKind::Inside,
-                );
-                let icon_c = Pos2::new(rect.left() + st.padding + st.icon / 2.0, rect.top() + st.padding + st.icon / 2.0);
-                paint_avatar(painter, st, icon_c, &e.app, appear, false);
-                let text_x = rect.left() + st.padding + if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 };
-                let when = if resp.hovered() { "×".to_string() } else { time_ago(e.time) };
-                paint_text(painter, st, Pos2::new(text_x, rect.top() + st.padding), text_w, &e.app, &when, &e.title, &e.body, appear, 6);
-                if resp.clicked() {
-                    actions.push(UiAction::DeleteEntry(i));
-                }
-                let app = e.app.clone();
-                resp.context_menu(|ui| {
-                    if ui.button("Delete").clicked() {
-                        actions.push(UiAction::DeleteEntry(i));
-                        ui.close_menu();
-                    }
-                    if ui.button(format!("Block notifications from {app}")).clicked() {
-                        actions.push(UiAction::Block(app.clone()));
-                        ui.close_menu();
-                    }
+            for (group_app, entries) in group_history_by_app(&self.stored.history) {
+                ui.horizontal(|ui| {
+                    let is_exc = self.is_dnd_exception(&group_app);
+                    let hdr = if is_exc {
+                        format!("{} ({}) • DND allowed", group_app, entries.len())
+                    } else {
+                        format!("{} ({})", group_app, entries.len())
+                    };
+                    ui.label(egui::RichText::new(hdr).size(st.app_size + 0.5).strong().color(st.sub.gamma_multiply(appear)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("Clear app").size(st.app_size)).frame(false))
+                            .on_hover_text(format!("Clear all notifications from {group_app}"))
+                            .clicked()
+                        {
+                            actions.push(UiAction::ClearAppHistory(group_app.clone()));
+                        }
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("Focus").size(st.app_size)).frame(false))
+                            .on_hover_text(format!("Switch to {group_app} window"))
+                            .clicked()
+                        {
+                            actions.push(UiAction::FocusAppWindow(group_app.clone()));
+                        }
+                    });
                 });
-                ui.add_space(st.gap * 0.6);
+                ui.add_space(2.0);
+                for (i, e) in entries {
+                    let note = Notification { app: e.app.clone(), title: e.title.clone(), body: e.body.clone(), ..Default::default() };
+                    let h = card_height(ui.ctx(), st, &note, text_w, 6);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width() - 4.0, h), Sense::click());
+                    let painter = ui.painter();
+                    painter.rect(
+                        rect,
+                        CornerRadius::same(st.radius.saturating_sub(2)),
+                        if resp.hovered() { st.border.gamma_multiply(0.35 * appear) } else { Color32::TRANSPARENT },
+                        Stroke::new(1.0_f32, st.border.gamma_multiply(appear)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let icon_c = Pos2::new(rect.left() + st.padding + st.icon / 2.0, rect.top() + st.padding + st.icon / 2.0);
+                    paint_avatar(painter, st, icon_c, &e.app, appear, false);
+                    let text_x = rect.left() + st.padding + if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 };
+                    let close_rect = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.top() + 14.0), Vec2::splat(20.0));
+                    let when = if resp.hovered() { "×".to_string() } else { time_ago(e.time) };
+                    paint_text(painter, st, Pos2::new(text_x, rect.top() + st.padding), text_w, &e.app, &when, &e.title, &e.body, appear, 6);
+                    if resp.clicked() {
+                        if ui.rect_contains_pointer(close_rect) {
+                            actions.push(UiAction::DeleteEntry(i));
+                        } else {
+                            actions.push(UiAction::FocusAppWindow(e.app.clone()));
+                        }
+                    }
+                    let app = e.app.clone();
+                    let is_exc = self.is_dnd_exception(&app);
+                    resp.context_menu(|ui| {
+                        if ui.button(format!("Focus {app} window")).clicked() {
+                            actions.push(UiAction::FocusAppWindow(app.clone()));
+                            ui.close_menu();
+                        }
+                        if ui.button("Delete notification").clicked() {
+                            actions.push(UiAction::DeleteEntry(i));
+                            ui.close_menu();
+                        }
+                        if ui.button(format!("Clear all from {app}")).clicked() {
+                            actions.push(UiAction::ClearAppHistory(app.clone()));
+                            ui.close_menu();
+                        }
+                        let exc_label = if is_exc {
+                            format!("Remove {app} from DND exceptions")
+                        } else {
+                            format!("Allow {app} during Do Not Disturb")
+                        };
+                        if ui.button(exc_label).clicked() {
+                            actions.push(UiAction::AllowInDnd(app.clone(), !is_exc));
+                            ui.close_menu();
+                        }
+                        if ui.button(format!("Block notifications from {app}")).clicked() {
+                            actions.push(UiAction::Block(app.clone()));
+                            ui.close_menu();
+                        }
+                    });
+                    ui.add_space(st.gap * 0.5);
+                }
+                ui.add_space(st.gap * 0.4);
             }
         });
 
-        if !self.cfg.blocked.is_empty() {
+        if has_footer {
             ui.separator();
-            ui.label(egui::RichText::new("Blocked apps (click to unblock)").size(st.app_size).color(st.sub));
-            ui.horizontal_wrapped(|ui| {
-                for app in &self.cfg.blocked {
-                    if ui.button(format!("{app}  ×")).on_hover_text("Allow notifications again").clicked() {
-                        actions.push(UiAction::Unblock(app.clone()));
+            if !self.cfg.dnd_exceptions.is_empty() {
+                ui.label(egui::RichText::new("Allowed during DND (click to remove)").size(st.app_size).color(st.sub));
+                ui.horizontal_wrapped(|ui| {
+                    for app in &self.cfg.dnd_exceptions {
+                        if ui.button(format!("{app}  ×")).on_hover_text("Stop allowing during DND").clicked() {
+                            actions.push(UiAction::AllowInDnd(app.clone(), false));
+                        }
                     }
-                }
-            });
+                });
+            }
+            if !self.cfg.blocked.is_empty() {
+                ui.label(egui::RichText::new("Blocked apps (click to unblock)").size(st.app_size).color(st.sub));
+                ui.horizontal_wrapped(|ui| {
+                    for app in &self.cfg.blocked {
+                        if ui.button(format!("{app}  ×")).on_hover_text("Allow notifications again").clicked() {
+                            actions.push(UiAction::Unblock(app.clone()));
+                        }
+                    }
+                });
+            }
         }
     }
 }
@@ -822,6 +1071,11 @@ fn prepare_window(frame: &eframe::Frame) -> bool {
     true
 }
 
+/// Notifications that arrived while the center was closed (the bar's bell shows the count).
+static UNREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Mirror of `do_not_disturb`, readable from the IPC thread.
+static DND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn spawn_ipc_server(tx: Sender<Incoming>) {
     std::thread::Builder::new()
         .name("notify-ipc".into())
@@ -835,6 +1089,12 @@ fn spawn_ipc_server(tx: Sender<Incoming>) {
                         let msg = match cmd {
                             IpcCommand::Notify(note) => Some(Incoming::Note { note, toast_id: None, created: None }),
                             IpcCommand::DismissNotifications => Some(Incoming::DismissAll),
+                            IpcCommand::QueryNotificationStatus => {
+                                return IpcResponse::NotificationStatus {
+                                    unread: UNREAD.load(std::sync::atomic::Ordering::Relaxed),
+                                    dnd: DND.load(std::sync::atomic::Ordering::Relaxed),
+                                };
+                            }
                             IpcCommand::ToggleNotificationCenter => Some(Incoming::ToggleCenter),
                             IpcCommand::ReloadConfig => Some(Incoming::Reload),
                             _ => None,
@@ -878,6 +1138,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     let options = eframe::NativeOptions {
+        // glow, not wgpu: egui_kittest (headless feature) also enables eframe's wgpu backend,
+        // which eframe would then prefer, and wgpu draws transparent windows black on Windows.
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("ChickenWM Notifications")
             .with_decorations(false)
@@ -897,4 +1160,38 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(App::new(cc, rx, tx)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_hours_handles_overnight_and_daytime_ranges() {
+        // Overnight: 22:00 (1320) to 07:00 (420)
+        assert!(is_in_quiet_hours("22:00-07:00", 23 * 60 + 15));
+        assert!(is_in_quiet_hours("22:00-07:00", 6 * 60 + 30));
+        assert!(!is_in_quiet_hours("22:00-07:00", 12 * 60));
+        assert!(!is_in_quiet_hours("22:00-07:00", 7 * 60));
+
+        // Daytime: 09:00 (540) to 17:00 (1020)
+        assert!(is_in_quiet_hours("09:00-17:00", 10 * 60));
+        assert!(!is_in_quiet_hours("09:00-17:00", 20 * 60));
+        assert!(!is_in_quiet_hours("", 10 * 60));
+    }
+
+    #[test]
+    fn history_groups_by_app_preserving_recency_order() {
+        let entries = vec![
+            HistoryEntry { app: "Discord".into(), title: "msg 1".into(), body: String::new(), time: 30, toast_id: None },
+            HistoryEntry { app: "Steam".into(), title: "update".into(), body: String::new(), time: 20, toast_id: None },
+            HistoryEntry { app: "discord".into(), title: "msg 2".into(), body: String::new(), time: 10, toast_id: None },
+        ];
+        let groups = group_history_by_app(&entries);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "Discord");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "Steam");
+        assert_eq!(groups[1].1.len(), 1);
+    }
 }
