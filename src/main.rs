@@ -1142,6 +1142,7 @@ fn main() -> anyhow::Result<()> {
         // which eframe would then prefer, and wgpu draws transparent windows black on Windows.
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
+            .with_icon(egui::IconData { rgba: include_bytes!("../assets/icon-64.rgba").to_vec(), width: 64, height: 64 })
             .with_title("ChickenWM Notifications")
             .with_decorations(false)
             .with_transparent(true)
