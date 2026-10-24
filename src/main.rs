@@ -1302,18 +1302,42 @@ fn apply_visuals(ctx: &egui::Context, st: &Style) {
 fn prepare_window(frame: &eframe::Frame) -> bool {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::{BOOL, HWND};
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW};
     let Ok(handle) = frame.window_handle() else { return false };
     let RawWindowHandle::Win32(h) = handle.as_raw() else { return false };
     let hwnd = HWND(h.hwnd.get() as _);
     chickenwm_core::sys::suppress_nc_paint(hwnd);
-    let _ = chickenwm_core::sys::apply_acrylic(hwnd, None);
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
         let off = BOOL(1);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const _ as *const core::ffi::c_void, 4);
+
+        let border_none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border_none as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let corner_pref = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner_pref as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let backdrop_none: u32 = 1; // DWMSBT_NONE
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop_none as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
     }
     true
 }
