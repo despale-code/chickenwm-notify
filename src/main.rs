@@ -1062,6 +1062,7 @@ fn prepare_window(frame: &eframe::Frame) -> bool {
     let Ok(handle) = frame.window_handle() else { return false };
     let RawWindowHandle::Win32(h) = handle.as_raw() else { return false };
     let hwnd = HWND(h.hwnd.get() as _);
+    chickenwm_core::sys::suppress_nc_paint(hwnd);
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
