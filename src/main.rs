@@ -148,6 +148,17 @@ fn time_ago(t: u64) -> String {
     }
 }
 
+fn blend_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    Color32::from_rgba_unmultiplied(
+        (a.r() as f32 * inv + b.r() as f32 * t).round() as u8,
+        (a.g() as f32 * inv + b.g() as f32 * t).round() as u8,
+        (a.b() as f32 * inv + b.b() as f32 * t).round() as u8,
+        a.a(),
+    )
+}
+
 // ───────────────────────────── app ─────────────────────────────
 
 struct Toast {
@@ -177,6 +188,9 @@ struct App {
     center_since: Instant,
     center_hovered_once: bool,
     center_left_at: Option<Instant>,
+    leaving_history: std::collections::HashMap<(u64, String, String), Instant>,
+    clearing_all_since: Option<Instant>,
+    clearing_apps: std::collections::HashMap<String, Instant>,
     last_frame: Instant,
     window_ready: bool,
     last_geometry: Option<(Pos2, Vec2, bool)>,
@@ -230,6 +244,9 @@ impl App {
             center_since: Instant::now(),
             center_hovered_once: false,
             center_left_at: None,
+            leaving_history: std::collections::HashMap::new(),
+            clearing_all_since: None,
+            clearing_apps: std::collections::HashMap::new(),
             last_frame: Instant::now(),
             window_ready: false,
             last_geometry: None,
@@ -538,14 +555,21 @@ impl eframe::App for App {
                 .any(|k| unsafe { GetAsyncKeyState(i32::from(k.0)) } as u16 & 0x8000 != 0);
 
             let center_rect = Rect::from_min_size(geometry.0, geometry.1);
-            let inside = cursor.is_some_and(|p| center_rect.expand(16.0).contains(p));
+            let inside = cursor.is_some_and(|p| center_rect.expand(14.0).contains(p));
+            let in_top_bar = cursor.is_some_and(|p| p.y <= work[1] + 44.0);
 
-            if self.center_since.elapsed() > Duration::from_millis(250) {
-                if inside || held {
+            if self.center_since.elapsed() > Duration::from_millis(200) {
+                if inside {
                     self.center_hovered_once = true;
                     self.center_left_at = None;
+                } else if held && !in_top_bar {
+                    actions.push(UiAction::CloseCenter);
                 } else if self.center_hovered_once {
-                    if self.center_left_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(250) {
+                    if self.center_left_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(180) {
+                        actions.push(UiAction::CloseCenter);
+                    }
+                } else if !in_top_bar && self.center_since.elapsed() > Duration::from_millis(550) {
+                    if self.center_left_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(200) {
                         actions.push(UiAction::CloseCenter);
                     }
                 }
@@ -575,12 +599,13 @@ impl eframe::App for App {
                 // Smooth reflow when cards above appear or leave.
                 let top = ui.ctx().animate_value_with_time(egui::Id::new(("toast-y", t.key)), top, 0.22);
                 let enter = ease_out(t.born.elapsed().as_secs_f32() / st.anim_secs);
-                let exit = t.leaving.map_or(0.0, |at| ease_out(at.elapsed().as_secs_f32() / (st.anim_secs * 0.8)));
-                let alpha = enter * (1.0 - exit);
-                let slide_dir = if hside == 0.0 { 0.0 } else { hside };
-                let dx = (1.0 - enter) * 40.0 * slide_dir + exit * 60.0 * slide_dir;
-                let dy = if hside == 0.0 { (1.0 - enter) * 16.0 * -vside } else { 0.0 };
-                let rect = Rect::from_min_size(Pos2::new(PAD + dx, top + dy), egui::vec2(st.card_w, h));
+                let exit = t.leaving.map_or(0.0, |at| ease_out(at.elapsed().as_secs_f32() / (st.anim_secs * 0.85)));
+                // Never fade alpha (fading alpha on layered OpenGL windows darkens toward black);
+                // instead slide vertically down from behind roobar on enter and slide UP behind roobar on exit.
+                let alpha = 1.0_f32;
+                let retract_dist = top + h + 28.0_f32;
+                let dy = -(1.0_f32 - enter) * retract_dist - exit * retract_dist;
+                let rect = Rect::from_min_size(Pos2::new(PAD, top + dy), egui::vec2(st.card_w, h));
                 draw_toast(ui, &st, t, rect, alpha, text_w, &mut actions);
             }
 
@@ -588,19 +613,20 @@ impl eframe::App for App {
             let any_live = self.toasts.iter().any(|t| t.leaving.is_none());
             let shown = ui.ctx().animate_bool_with_time(egui::Id::new("clear-all-shown"), any_live, st.anim_secs);
             if shown > 0.01 {
-                let btn_y = if vside < 0.0 { PAD + stack_h + st.gap } else { size.y - PAD - CLEAR_BTN };
-                let btn_y = ui.ctx().animate_value_with_time(egui::Id::new("clear-all-y"), btn_y, 0.22);
-                let center = Pos2::new(PAD + st.card_w / 2.0, btn_y + CLEAR_BTN / 2.0);
+                let target_btn_y = if vside < 0.0 { PAD + stack_h + st.gap } else { size.y - PAD - CLEAR_BTN };
+                let btn_y = ui.ctx().animate_value_with_time(egui::Id::new("clear-all-y"), target_btn_y, 0.22);
+                let btn_retract = (1.0 - shown) * (btn_y + CLEAR_BTN + 28.0);
+                let center = Pos2::new(PAD + st.card_w / 2.0, btn_y - btn_retract + CLEAR_BTN / 2.0);
                 let hit = Rect::from_center_size(center, Vec2::splat(CLEAR_BTN));
                 let resp = ui.interact(hit, egui::Id::new("clear-all"), Sense::click()).on_hover_text("Clear all notifications");
                 let hover = ui.ctx().animate_bool_with_time(egui::Id::new("clear-all-hover"), resp.hovered(), 0.12);
-                let r = CLEAR_BTN / 2.0 * (0.85 + 0.15 * shown) * (1.0 + 0.08 * hover);
+                let r = CLEAR_BTN / 2.0 * (1.0 + 0.08 * hover);
                 let painter = ui.painter();
-                let shadow = egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: st.shadow.gamma_multiply(shown) };
+                let shadow = egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: st.shadow };
                 painter.add(shadow.as_shape(Rect::from_center_size(center, Vec2::splat(r * 2.0)), CornerRadius::same(r as u8)));
-                painter.circle(center, r, st.card_bg.gamma_multiply(shown), Stroke::new(1.0_f32, st.border.gamma_multiply(shown)));
+                painter.circle(center, r, st.card_bg, Stroke::new(1.0_f32, st.border));
                 let glyph = if hover > 0.5 { st.fg } else { st.sub };
-                painter.text(center, Align2::CENTER_CENTER, "×", FontId::proportional(15.0 + 2.0 * hover), glyph.gamma_multiply(shown));
+                painter.text(center, Align2::CENTER_CENTER, "×", FontId::proportional(15.0 + 2.0 * hover), glyph);
                 if resp.clicked() && any_live {
                     actions.push(UiAction::DismissAll);
                 }
@@ -608,8 +634,56 @@ impl eframe::App for App {
         });
 
         // Remove finished exits.
-        let exit_secs = st.anim_secs * 0.8;
+        let exit_secs = st.anim_secs * 0.85;
         self.toasts.retain(|t| t.leaving.is_none_or(|at| at.elapsed().as_secs_f32() < exit_secs));
+
+        // Finalize animated history deletions once their 0.22s collapse/slide animation completes.
+        const HIST_EXIT_SECS: f32 = 0.22;
+        let mut store_dirty = false;
+        if let Some(since) = self.clearing_all_since {
+            if since.elapsed().as_secs_f32() >= HIST_EXIT_SECS {
+                self.stored.history.clear();
+                self.leaving_history.clear();
+                self.clearing_apps.clear();
+                self.clearing_all_since = None;
+                store_dirty = true;
+            }
+        }
+        let finished_apps: Vec<String> = self
+            .clearing_apps
+            .iter()
+            .filter_map(|(k, at)| (at.elapsed().as_secs_f32() >= HIST_EXIT_SECS).then(|| k.clone()))
+            .collect();
+        for app_key in finished_apps {
+            self.clearing_apps.remove(&app_key);
+            self.stored
+                .history
+                .retain(|e| !e.app.eq_ignore_ascii_case(&app_key));
+            store_dirty = true;
+        }
+        let finished_entries: Vec<(u64, String, String)> = self
+            .leaving_history
+            .iter()
+            .filter_map(|(k, at)| (at.elapsed().as_secs_f32() >= HIST_EXIT_SECS).then(|| k.clone()))
+            .collect();
+        for key in finished_entries {
+            self.leaving_history.remove(&key);
+            if let Some(pos) = self
+                .stored
+                .history
+                .iter()
+                .position(|e| (e.time, e.app.clone(), e.title.clone()) == key)
+            {
+                let e = self.stored.history.remove(pos);
+                if let Some(id) = e.toast_id {
+                    std::thread::spawn(move || toasts::remove(id));
+                }
+                store_dirty = true;
+            }
+        }
+        if store_dirty {
+            self.save_store();
+        }
 
         for a in actions {
             match a {
@@ -619,7 +693,9 @@ impl eframe::App for App {
                 UiAction::Unblock(app) => self.set_blocked(&app, false),
                 UiAction::AllowInDnd(app, allow) => self.set_dnd_exception(&app, allow),
                 UiAction::SetQuietHours(s) => self.save_quiet_hours(s),
-                UiAction::ClearAppHistory(app) => self.clear_app_history(&app),
+                UiAction::ClearAppHistory(app) => {
+                    self.clearing_apps.entry(app.to_ascii_lowercase()).or_insert_with(Instant::now);
+                }
                 UiAction::FocusAppWindow(app) => {
                     focus_source_window(&app);
                     self.center_open = false;
@@ -630,16 +706,14 @@ impl eframe::App for App {
                 }
                 UiAction::CloseCenter => self.center_open = false,
                 UiAction::ClearHistory => {
-                    self.stored.history.clear();
-                    self.save_store();
+                    if !self.stored.history.is_empty() && self.clearing_all_since.is_none() {
+                        self.clearing_all_since = Some(Instant::now());
+                    }
                 }
                 UiAction::DeleteEntry(i) => {
-                    if i < self.stored.history.len() {
-                        let e = self.stored.history.remove(i);
-                        if let Some(id) = e.toast_id {
-                            std::thread::spawn(move || toasts::remove(id));
-                        }
-                        self.save_store();
+                    if let Some(e) = self.stored.history.get(i) {
+                        let key = (e.time, e.app.clone(), e.title.clone());
+                        self.leaving_history.entry(key).or_insert_with(Instant::now);
                     }
                 }
                 UiAction::CycleAppearance => {
@@ -660,7 +734,12 @@ impl eframe::App for App {
             }
         }
 
-        let animating = !self.toasts.is_empty() || self.center_open && self.center_since.elapsed().as_secs_f32() < st.anim_secs;
+        let history_animating = self.clearing_all_since.is_some()
+            || !self.clearing_apps.is_empty()
+            || !self.leaving_history.is_empty();
+        let animating = !self.toasts.is_empty()
+            || history_animating
+            || (self.center_open && self.center_since.elapsed().as_secs_f32() < st.anim_secs);
         if animating {
             ctx.request_repaint();
         } else if !self.queue.is_empty() {
@@ -669,6 +748,7 @@ impl eframe::App for App {
     }
 }
 
+#[allow(dead_code)]
 enum UiAction {
     Dismiss(u64),
     DismissAll,
@@ -890,69 +970,163 @@ fn focus_source_window(app: &str) {
 }
 
 impl App {
+    fn entry_exit_progress(&self, e: &HistoryEntry) -> f32 {
+        let mut t = 0.0_f32;
+        if let Some(at) = self.clearing_all_since {
+            t = t.max(ease_out(at.elapsed().as_secs_f32() / 0.22));
+        }
+        if let Some(at) = self.clearing_apps.get(&e.app.to_ascii_lowercase()) {
+            t = t.max(ease_out(at.elapsed().as_secs_f32() / 0.22));
+        }
+        let key = (e.time, e.app.clone(), e.title.clone());
+        if let Some(at) = self.leaving_history.get(&key) {
+            t = t.max(ease_out(at.elapsed().as_secs_f32() / 0.22));
+        }
+        t.clamp(0.0, 1.0)
+    }
+
     fn draw_center(&self, ui: &mut egui::Ui, st: &Style, actions: &mut Vec<UiAction>) {
         let full = ui.max_rect().shrink(PAD);
         let appear = ease_out(self.center_since.elapsed().as_secs_f32() / st.anim_secs);
         let (hside, _) = self.side();
         let dir = if hside < 0.0 { -1.0 } else { 1.0 };
         let panel = full.translate(egui::vec2((1.0 - appear) * 40.0 * dir, 0.0));
-        paint_card(ui.painter(), st, panel, appear, false);
 
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel.shrink(st.padding)));
-        let ui = &mut child;
-        ui.visuals_mut().override_text_color = Some(st.fg.gamma_multiply(appear));
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Notifications").size(st.title_size + 4.0).color(st.fg.gamma_multiply(appear)));
+        let header_h = 52.0_f32;
+        let header_rect = Rect::from_min_size(panel.min, egui::vec2(panel.width(), header_h));
+        let body_rect = Rect::from_min_max(Pos2::new(panel.left(), panel.top() + header_h), panel.max);
+
+        let is_dark = match self.app_mode {
+            chickenwm_core::theme::AppMode::Dark => true,
+            chickenwm_core::theme::AppMode::Light => false,
+            chickenwm_core::theme::AppMode::System => {
+                (st.card_bg.r() as u32 + st.card_bg.g() as u32 + st.card_bg.b() as u32) < 384
+            }
+        };
+
+        let painter = ui.painter();
+
+        // 1. Draw shadow behind panel
+        let shadow = egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 22,
+            spread: 0,
+            color: st.shadow.gamma_multiply(appear),
+        };
+        painter.add(shadow.as_shape(panel, CornerRadius::same(st.radius)));
+
+        // 2. Fill header_rect with lighter color with top rounded corners
+        let header_fill = if is_dark {
+            blend_color(st.card_bg, Color32::from_rgb(210, 225, 245), 0.16)
+        } else {
+            blend_color(st.card_bg, Color32::WHITE, 0.16)
+        };
+        let header_radius = CornerRadius { nw: st.radius, ne: st.radius, sw: 0, se: 0 };
+        painter.rect_filled(header_rect, header_radius, header_fill.gamma_multiply(appear));
+
+        // 3. Fill body_rect with deeper/darker color with bottom rounded corners
+        let body_fill = blend_color(st.card_bg, Color32::from_rgb(10, 12, 18), 0.14);
+        let body_radius = CornerRadius { nw: 0, ne: 0, sw: st.radius, se: st.radius };
+        painter.rect_filled(body_rect, body_radius, body_fill.gamma_multiply(appear));
+
+        // 4. Crisp 1.0_f32 separator line at header_rect.bottom()
+        painter.line_segment(
+            [
+                Pos2::new(header_rect.left(), header_rect.bottom()),
+                Pos2::new(header_rect.right(), header_rect.bottom()),
+            ],
+            Stroke::new(1.0_f32, st.border.gamma_multiply(appear)),
+        );
+
+        // 5. Outer border around panel
+        painter.rect_stroke(
+            panel,
+            CornerRadius::same(st.radius),
+            Stroke::new(1.0_f32, st.border.gamma_multiply(appear)),
+            egui::StrokeKind::Inside,
+        );
+
+        // Top Header Bar contents
+        let mut header_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(header_rect.shrink2(egui::vec2(st.padding, 0.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        header_ui.visuals_mut().override_text_color = Some(st.fg.gamma_multiply(appear));
+        header_ui.horizontal_centered(|ui| {
+            ui.label(
+                egui::RichText::new("Notifications")
+                    .size(st.title_size + 3.0)
+                    .strong()
+                    .color(st.fg.gamma_multiply(appear)),
+            );
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new("×").frame(false)).on_hover_text("Close (Super+N)").clicked() {
-                    actions.push(UiAction::CloseCenter);
-                }
-                if ui.add(egui::Button::new("Clear all").frame(false)).clicked() {
-                    actions.push(UiAction::ClearHistory);
-                }
-                let mode_label = match self.app_mode {
-                    chickenwm_core::theme::AppMode::System => "Appearance: follow system (click for light)",
-                    chickenwm_core::theme::AppMode::Light => "Appearance: light (click for dark)",
-                    chickenwm_core::theme::AppMode::Dark => "Appearance: dark (click to follow system)",
+                // Moon Icon Toggle Button (28x28)
+                let (moon_rect, moon_resp) = ui.allocate_exact_size(egui::vec2(28.0_f32, 28.0_f32), Sense::click());
+                let moon_hover = ui.ctx().animate_bool_with_time(moon_resp.id, moon_resp.hovered(), 0.15_f32);
+                let dnd_on = self.stored.do_not_disturb;
+                let moon_bg = if dnd_on {
+                    Color32::from_rgb(135, 95, 245)
+                } else {
+                    st.border.gamma_multiply(0.45 * appear)
                 };
-                if ui.add(egui::Button::new("◐").frame(false)).on_hover_text(mode_label).clicked() {
-                    actions.push(UiAction::CycleAppearance);
+                let moon_fg = if dnd_on {
+                    Color32::WHITE
+                } else {
+                    st.fg.gamma_multiply(appear)
+                };
+                let btn_radius = CornerRadius::same(14);
+                ui.painter().rect_filled(moon_rect, btn_radius, moon_bg);
+                if moon_hover > 0.0_f32 {
+                    ui.painter().rect_filled(
+                        moon_rect,
+                        btn_radius,
+                        Color32::WHITE.gamma_multiply(0.18 * moon_hover),
+                    );
+                }
+                let moon_icon_r = Rect::from_center_size(moon_rect.center(), egui::vec2(16.0_f32, 16.0_f32));
+                chickenwm_core::ui_icons::paint_moon(ui.painter(), moon_icon_r, moon_fg);
+                let moon_resp = moon_resp.on_hover_text(if dnd_on { "Do Not Disturb: On" } else { "Do Not Disturb: Off" });
+                if moon_resp.clicked() {
+                    actions.push(UiAction::ToggleDnd);
+                }
+
+                ui.add_space(4.0_f32);
+
+                // "Clear all" button (to the left of Moon button, shown when !self.stored.history.is_empty())
+                if !self.stored.history.is_empty() {
+                    let clear_btn = egui::Button::new(
+                        egui::RichText::new("Clear all")
+                            .size(st.app_size + 0.5)
+                            .color(st.sub.gamma_multiply(appear)),
+                    )
+                    .corner_radius(CornerRadius::same(6))
+                    .fill(st.border.gamma_multiply(0.25 * appear))
+                    .stroke(Stroke::new(1.0_f32, st.border.gamma_multiply(0.4 * appear)));
+                    if ui.add(clear_btn).clicked() {
+                        actions.push(UiAction::ClearHistory);
+                    }
                 }
             });
         });
-        ui.add_space(4.0);
-        let quiet_now = self.is_quiet_hours_now();
-        let mut dnd = self.stored.do_not_disturb;
-        let dnd_label = if quiet_now && !dnd {
-            format!("Do not disturb (active via quiet hours {})", self.cfg.quiet_hours)
-        } else {
-            "Do not disturb (only critical / exception apps pop up)".to_string()
-        };
-        if ui.checkbox(&mut dnd, dnd_label).changed() {
-            actions.push(UiAction::ToggleDnd);
-        }
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Quiet hours:").size(st.app_size).color(st.sub));
-            let current_qh = if self.cfg.quiet_hours.is_empty() { "Off" } else { &self.cfg.quiet_hours };
-            ui.label(egui::RichText::new(current_qh).size(st.app_size).color(st.fg));
-            for (label, sched) in [("Off", ""), ("22:00–07:00", "22:00-07:00"), ("23:00–08:00", "23:00-08:00")] {
-                let selected = self.cfg.quiet_hours == sched;
-                if ui.selectable_label(selected, egui::RichText::new(label).size(st.app_size)).clicked() {
-                    actions.push(UiAction::SetQuietHours(sched.to_string()));
-                }
-            }
-        });
-        ui.add_space(6.0);
-        ui.separator();
+
+        // Bottom Notification List Area
+        let mut body_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body_rect.shrink2(egui::vec2(st.padding, 10.0_f32))),
+        );
+        let ui = &mut body_ui;
+        ui.visuals_mut().override_text_color = Some(st.fg.gamma_multiply(appear));
 
         let has_footer = !self.cfg.blocked.is_empty() || !self.cfg.dnd_exceptions.is_empty();
         let footer_h = if has_footer { 84.0 } else { 0.0 };
         let list_h = (ui.available_height() - footer_h).max(60.0);
-        let text_w = ui.available_width() - st.padding * 2.0 - if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 } - 8.0;
+
         egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             if self.stored.history.is_empty() {
                 ui.add_space(40.0);
-                ui.vertical_centered(|ui| ui.label(egui::RichText::new("No notifications").color(st.sub)));
+                ui.vertical_centered(|ui| ui.label(egui::RichText::new("No notifications").color(st.sub.gamma_multiply(appear))));
             }
             for (group_app, entries) in group_history_by_app(&self.stored.history) {
                 ui.horizontal(|ui| {
@@ -982,23 +1156,55 @@ impl App {
                 });
                 ui.add_space(2.0);
                 for (i, e) in entries {
-                    let note = Notification { app: e.app.clone(), title: e.title.clone(), body: e.body.clone(), ..Default::default() };
-                    let h = card_height(ui.ctx(), st, &note, text_w, 6);
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width() - 4.0, h), Sense::click());
+                    let exit_t = self.entry_exit_progress(e);
+                    let note = Notification {
+                        app: e.app.clone(),
+                        title: e.title.clone(),
+                        body: e.body.clone(),
+                        ..Default::default()
+                    };
+
+                    let card_w = ui.available_width() - 4.0;
+                    let text_w = (card_w - st.padding * 2.0 - if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 } - 8.0).max(100.0);
+
+                    let full_h = card_height(ui.ctx(), st, &note, text_w, 6);
+                    let alloc_h = (full_h * (1.0 - exit_t)).max(1.0);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(card_w, alloc_h), Sense::click());
+                    let slide_x = exit_t * (rect.width() + 40.0);
+                    let card_rect = Rect::from_min_size(Pos2::new(rect.min.x + slide_x, rect.min.y), egui::vec2(rect.width(), full_h));
+
+                    let card_alpha = ((1.0 - exit_t) * appear).clamp(0.0, 1.0);
+                    let card_fill = if resp.hovered() {
+                        blend_color(st.card_bg, if is_dark { Color32::from_rgb(220, 230, 250) } else { Color32::WHITE }, 0.18)
+                    } else {
+                        blend_color(st.card_bg, if is_dark { Color32::from_rgb(220, 230, 250) } else { Color32::WHITE }, 0.10)
+                    };
+
                     let painter = ui.painter();
-                    painter.rect(
-                        rect,
-                        CornerRadius::same(st.radius.saturating_sub(2)),
-                        if resp.hovered() { st.border.gamma_multiply(0.35 * appear) } else { Color32::TRANSPARENT },
-                        Stroke::new(1.0_f32, st.border.gamma_multiply(appear)),
+                    let card_radius = CornerRadius::same(st.radius.saturating_sub(2));
+                    painter.rect_filled(card_rect, card_radius, card_fill.gamma_multiply(card_alpha));
+                    painter.rect_stroke(
+                        card_rect,
+                        card_radius,
+                        Stroke::new(1.0_f32, st.border.gamma_multiply(if resp.hovered() { card_alpha * 0.7 } else { card_alpha * 0.4 })),
                         egui::StrokeKind::Inside,
                     );
-                    let icon_c = Pos2::new(rect.left() + st.padding + st.icon / 2.0, rect.top() + st.padding + st.icon / 2.0);
-                    paint_avatar(painter, st, icon_c, &e.app, appear, false);
-                    let text_x = rect.left() + st.padding + if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 };
-                    let close_rect = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.top() + 14.0), Vec2::splat(20.0));
-                    let when = if resp.hovered() { "×".to_string() } else { time_ago(e.time) };
-                    paint_text(painter, st, Pos2::new(text_x, rect.top() + st.padding), text_w, &e.app, &when, &e.title, &e.body, appear, 6);
+
+                    let icon_c = Pos2::new(card_rect.left() + st.padding + st.icon / 2.0, card_rect.top() + st.padding + st.icon / 2.0);
+                    paint_avatar(painter, st, icon_c, &e.app, card_alpha, false);
+                    let text_x = card_rect.left() + st.padding + if st.icon > 0.0 { st.icon + 10.0 } else { 0.0 };
+                    let close_rect = Rect::from_center_size(Pos2::new(card_rect.right() - 16.0, card_rect.top() + 14.0), Vec2::splat(20.0));
+                    let when = if resp.hovered() { String::new() } else { time_ago(e.time) };
+                    paint_text(painter, st, Pos2::new(text_x, card_rect.top() + st.padding), text_w, &e.app, &when, &e.title, &e.body, card_alpha, 6);
+
+                    if resp.hovered() {
+                        let over_close = ui.rect_contains_pointer(close_rect);
+                        if over_close {
+                            painter.circle_filled(close_rect.center(), 10.0, st.border.gamma_multiply(card_alpha * 0.6));
+                        }
+                        chickenwm_core::ui_icons::paint_close(painter, close_rect, st.sub.gamma_multiply(card_alpha));
+                    }
+
                     if resp.clicked() {
                         if ui.rect_contains_pointer(close_rect) {
                             actions.push(UiAction::DeleteEntry(i));
@@ -1047,7 +1253,7 @@ impl App {
                 ui.label(egui::RichText::new("Allowed during DND (click to remove)").size(st.app_size).color(st.sub));
                 ui.horizontal_wrapped(|ui| {
                     for app in &self.cfg.dnd_exceptions {
-                        if ui.button(format!("{app}  ×")).on_hover_text("Stop allowing during DND").clicked() {
+                        if ui.button(format!("{app}  -")).on_hover_text("Stop allowing during DND").clicked() {
                             actions.push(UiAction::AllowInDnd(app.clone(), false));
                         }
                     }
@@ -1057,7 +1263,7 @@ impl App {
                 ui.label(egui::RichText::new("Blocked apps (click to unblock)").size(st.app_size).color(st.sub));
                 ui.horizontal_wrapped(|ui| {
                     for app in &self.cfg.blocked {
-                        if ui.button(format!("{app}  ×")).on_hover_text("Allow notifications again").clicked() {
+                        if ui.button(format!("{app}  -")).on_hover_text("Allow notifications again").clicked() {
                             actions.push(UiAction::Unblock(app.clone()));
                         }
                     }
@@ -1102,6 +1308,7 @@ fn prepare_window(frame: &eframe::Frame) -> bool {
     let RawWindowHandle::Win32(h) = handle.as_raw() else { return false };
     let hwnd = HWND(h.hwnd.get() as _);
     chickenwm_core::sys::suppress_nc_paint(hwnd);
+    let _ = chickenwm_core::sys::apply_acrylic(hwnd, None);
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
