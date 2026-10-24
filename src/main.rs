@@ -32,6 +32,7 @@ pub enum Incoming {
     History { note: Notification, created: u64 },
     DismissAll,
     ToggleCenter,
+    CloseCenter,
     Reload,
 }
 
@@ -174,6 +175,8 @@ struct App {
     next_key: u64,
     center_open: bool,
     center_since: Instant,
+    center_hovered_once: bool,
+    center_left_at: Option<Instant>,
     last_frame: Instant,
     window_ready: bool,
     last_geometry: Option<(Pos2, Vec2, bool)>,
@@ -225,6 +228,8 @@ impl App {
             next_key: 1,
             center_open: false,
             center_since: Instant::now(),
+            center_hovered_once: false,
+            center_left_at: None,
             last_frame: Instant::now(),
             window_ready: false,
             last_geometry: None,
@@ -395,9 +400,16 @@ impl App {
                 Incoming::ToggleCenter => {
                     self.center_open = !self.center_open;
                     self.center_since = Instant::now();
+                    self.center_hovered_once = false;
+                    self.center_left_at = None;
                     if self.center_open {
                         UNREAD.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
+                }
+                Incoming::CloseCenter => {
+                    self.center_open = false;
+                    self.center_hovered_once = false;
+                    self.center_left_at = None;
                 }
                 Incoming::Reload => {
                     self.cfg = load_config();
@@ -513,6 +525,33 @@ impl eframe::App for App {
         }
 
         let mut actions: Vec<UiAction> = Vec::new();
+
+        if self.center_open {
+            use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
+            let mut pt = windows::Win32::Foundation::POINT::default();
+            let cursor = unsafe { GetCursorPos(&mut pt) }.is_ok().then(|| {
+                Pos2::new(pt.x as f32 / ppp, pt.y as f32 / ppp)
+            });
+            let held = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+                .iter()
+                .any(|k| unsafe { GetAsyncKeyState(i32::from(k.0)) } as u16 & 0x8000 != 0);
+
+            let center_rect = Rect::from_min_size(geometry.0, geometry.1);
+            let inside = cursor.is_some_and(|p| center_rect.expand(16.0).contains(p));
+
+            if self.center_since.elapsed() > Duration::from_millis(250) {
+                if inside || held {
+                    self.center_hovered_once = true;
+                    self.center_left_at = None;
+                } else if self.center_hovered_once {
+                    if self.center_left_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(250) {
+                        actions.push(UiAction::CloseCenter);
+                    }
+                }
+            }
+        }
+
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
             if self.center_open {
                 self.draw_center(ui, &st, &mut actions);
@@ -1097,6 +1136,7 @@ fn spawn_ipc_server(tx: Sender<Incoming>) {
                                 };
                             }
                             IpcCommand::ToggleNotificationCenter => Some(Incoming::ToggleCenter),
+                            IpcCommand::CloseNotificationCenter => Some(Incoming::CloseCenter),
                             IpcCommand::ReloadConfig => Some(Incoming::Reload),
                             _ => None,
                         };
